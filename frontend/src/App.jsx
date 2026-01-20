@@ -3,20 +3,12 @@ import { Search, Music, AlertCircle } from 'lucide-react';
 const VideoCard = lazy(() => import('./VideoCard'));
 
 // Helper: safely produce a base API URL
-// Dev (vite) => use relative '/api' so Vite proxy handles it
-// Prod => use VITE_API_URL if provided (should include /api), otherwise fallback to localhost
 const isDev = Boolean(import.meta.env.DEV);
 const rawProdApi = (import.meta.env.VITE_API_URL || 'http://localhost:5000/api').toString().trim();
-
-// ensure no trailing slash for the base (we'll append segments safely)
 const prodApiBase = rawProdApi.replace(/\/$/, '');
+const API_BASE = isDev ? '/api' : prodApiBase;
 
-// final API base used by code:
-const API_BASE = isDev ? '/api' : prodApiBase; // in dev, use relative path so proxy works
-
-// safe join function so `${API_BASE}/search` never becomes invalid
 function joinApi(path) {
-  // path may already include query string, e.g. '/search?query=foo'
   return `${API_BASE.replace(/\/$/, '')}/${path.replace(/^\//, '')}`;
 }
 
@@ -37,7 +29,7 @@ function App() {
   const [query, setQuery] = useState('');
   const [videos, setVideos] = useState([]);
   const [loading, setLoading] = useState(false);
-  const [downloading, setDownloading] = useState({}); // key -> {progress, size, downloading}
+  const [downloading, setDownloading] = useState({}); // key -> {progress, size, downloading, status}
   const [error, setError] = useState('');
   const [healthStatus, setHealthStatus] = useState(null);
 
@@ -90,18 +82,39 @@ function App() {
     }
   };
 
-  // Stream-download, supports progress (if Content-Length present)
+  // NEW: Stream-download with SSE progress (works for mp4 and mp3)
   const downloadFile = async (videoId, title, format) => {
     const key = `${videoId}_${format}`;
-    setDownloading(prev => ({ ...prev, [key]: { downloading: true, progress: 0, size: null } }));
+    setDownloading(prev => ({ ...prev, [key]: { downloading: true, progress: 0, size: null, status: 'starting' } }));
     setError('');
 
+    // Open SSE progress channel
+    let es;
+    try {
+      es = new EventSource(joinApi(`/progress/${encodeURIComponent(key)}`));
+      es.onmessage = (ev) => {
+        try {
+          const data = JSON.parse(ev.data);
+          setDownloading(prev => ({ ...prev, [key]: { ...prev[key], ...data } }));
+        } catch (e) {
+          // ignore parse errors
+        }
+      };
+      es.onerror = (e) => {
+        // SSE might error silently; don't treat as fatal — we'll still stream response bytes
+        console.warn('SSE error', e);
+      };
+    } catch (e) {
+      console.warn('Could not open progress EventSource', e);
+    }
+
     const controller = new AbortController();
-    // generous timeout (8 minutes) for large downloads
     const timeoutId = setTimeout(() => controller.abort(), 8 * 60 * 1000);
 
     try {
-      const response = await fetch(joinApi(`/download/${videoId}?format=${format}`), {
+      // include key so server links ffmpeg -> SSE emitter
+      const url = joinApi(`/download/${videoId}?format=${format}&key=${encodeURIComponent(key)}`);
+      const response = await fetch(url, {
         method: 'GET',
         mode: 'cors',
         signal: controller.signal
@@ -114,17 +127,14 @@ function App() {
         throw new Error(errData.error || `Download failed (${response.status})`);
       }
 
-      // filename from header (supports urlencoded and RFC5987)
-      const cd = response.headers.get('Content-Disposition');
-      let filename = parseContentDisposition(cd) || `${title.replace(/[^\w\s.-]/gi, '').substring(0, 50)}.${format}`;
-
-      // Read stream and build blob incrementally to show progress
+      // get Content-Length for mp4 case
       const contentLength = response.headers.get('Content-Length');
       const total = contentLength ? parseInt(contentLength, 10) : null;
       if (total) {
         setDownloading(prev => ({ ...prev, [key]: { ...prev[key], size: total } }));
       }
 
+      // read response stream (we still need to assemble blob client-side)
       const reader = response.body.getReader();
       const chunks = [];
       let received = 0;
@@ -133,12 +143,16 @@ function App() {
         if (done) break;
         chunks.push(value);
         received += value.length;
-        setDownloading(prev => ({ ...prev, [key]: { ...prev[key], downloading: true, progress: total ? Math.floor((received / total) * 100) : null, size: total } }));
+        // only update progress by bytes if we have a total; otherwise SSE will update progress
+        setDownloading(prev => ({ ...prev, [key]: { ...prev[key], downloading: true, progress: total ? Math.floor((received / total) * 100) : prev[key]?.progress } }));
       }
 
-      // Combine and save
       const blob = new Blob(chunks, { type: response.headers.get('Content-Type') || (format === 'mp3' ? 'audio/mpeg' : 'video/mp4') });
       if (!blob || blob.size === 0) throw new Error('Empty file received');
+
+      // derive filename from header (fallback to sanitized title)
+      let filename = parseContentDisposition(response.headers.get('Content-Disposition')) || `${title.replace(/[^\w\s.-]/gi, '').substring(0, 50)}.${format}`;
+      try { filename = decodeURIComponent(filename); } catch (_) { }
 
       const objectUrl = window.URL.createObjectURL(blob);
       const link = document.createElement('a');
@@ -148,7 +162,9 @@ function App() {
       link.click();
       link.remove();
       setTimeout(() => window.URL.revokeObjectURL(objectUrl), 1500);
-      console.log(`Downloaded ${filename} (${blob.size} bytes)`);
+
+      // ensure UI shows 100%
+      setDownloading(prev => ({ ...prev, [key]: { ...prev[key], progress: 100, status: 'done' } }));
     } catch (err) {
       clearTimeout(timeoutId);
       if (err.name === 'AbortError' || (err.message && err.message.toLowerCase().includes('timed out'))) {
@@ -158,11 +174,16 @@ function App() {
       }
       console.error('Download error:', err);
     } finally {
-      setDownloading(prev => {
-        const copy = { ...prev };
-        delete copy[key];
-        return copy;
-      });
+      // close SSE
+      try { if (es) es.close(); } catch (_) { }
+      // remove downloading state after a short delay so UI can show "Done" briefly
+      setTimeout(() => {
+        setDownloading(prev => {
+          const copy = { ...prev };
+          delete copy[key];
+          return copy;
+        });
+      }, 1500);
     }
   };
 
@@ -178,104 +199,113 @@ function App() {
   const formatViews = (views) => {
     if (!views && views !== 0) return '0 views';
     if (views >= 1000000) return `${(views / 1000000).toFixed(1)}M views`;
-    if (views >= 1000) return `${(views / 1000).toFixed(1)}K views`;
+    if (views >= 1000) return `${(views / 1000).toFixed(2)}K views`;
     return `${views} views`;
   };
 
   const SkeletonCard = () => (
-    <div className="skeleton-card">
-      <div className="skel-thumb shimmer"></div>
-      <div className="skel-body">
-        <div className="skel-line full shimmer"></div>
-        <div className="skel-line mid shimmer"></div>
-        <div className="skel-line short shimmer" style={{ marginTop: 8 }}></div>
+    <div className="rounded-xl bg-white overflow-hidden shadow-card">
+      <div className="w-full pt-[56.25%] bg-indigo-50 animate-shimmer bg-[length:400%_100%]"></div>
+      <div className="p-3">
+        <div className="h-3 rounded-md bg-slate-100 mb-2 w-full animate-shimmer"></div>
+        <div className="h-3 rounded-md bg-slate-100 mb-2 w-[70%] animate-shimmer"></div>
+        <div className="h-3 rounded-md bg-slate-100 w-[40%] animate-shimmer" style={{ marginTop: 8 }}></div>
       </div>
     </div>
   );
 
   return (
-    <div className="app">
-      <header className="header">
-        <div className="logo">
-          <Music size={32} />
-          <div>
-            <h1>YouTube Downloader</h1>
-            <small>For educational purposes only</small>
-          </div>
-        </div>
-
-        <div className="health-status" title="Server health">
-          <div className={`status-dot ${healthStatus && healthStatus.status === 'OK' ? 'online' : (healthStatus && healthStatus.status === 'DOWN' ? 'offline' : '')}`}></div>
-        </div>
-      </header>
-
-      <main className="main">
-        <form onSubmit={searchVideos} className="search-form" role="search" aria-label="Search videos">
-          <div className="search-input">
-            <Search size={18} />
-            <input
-              type="text" value={query} onChange={(e) => setQuery(e.target.value)}
-              placeholder="Search YouTube videos..." disabled={loading} autoFocus aria-label="Search query"
-            />
-            {query && <button type="button" className="clear-btn" onClick={() => { setQuery(''); setVideos([]); }}>×</button>}
+    <div className="min-h-screen bg-[#f6f7fb] text-[#222] font-sans antialiased">
+      <div className="max-w-[1100px] mx-auto mt-5 p-[18px]">
+        <header className="flex items-center justify-between mb-4">
+          <div className="flex gap-3 items-center">
+            <Music size={32} />
+            <div>
+              <h1 className="text-lg m-0 font-medium">YouTube Downloader</h1>
+            </div>
           </div>
 
-          <button type="submit" disabled={loading || !query.trim()} className="search-btn">
-            {loading ? 'Searching...' : 'Search'}
-          </button>
-        </form>
-
-        {error && (
-          <div className="error-message" role="alert">
-            <AlertCircle size={18} />
-            <span>{error}</span>
-            <button className="close-error" onClick={() => setError('')}>×</button>
+          <div className="flex gap-2 items-center text-gray-700 text-sm" title="Server health">
+            <div className={
+              `w-2.5 h-2.5 rounded-full ${healthStatus && healthStatus.status === 'OK' ? 'bg-emerald-500' :
+                (healthStatus && healthStatus.status === 'DOWN' ? 'bg-red-500' : 'bg-gray-300')
+              }`
+            } />
           </div>
-        )}
+        </header>
 
-        {videos.length > 0 && (
-          <div className="results-info">
-            <p>Found {videos.length} video{videos.length !== 1 ? 's' : ''}</p>
-            <button className="clear-results" onClick={() => setVideos([])}>Clear Results</button>
-          </div>
-        )}
-
-        <div className="video-grid" aria-live="polite">
-          {videos.map(video => (
-            <Suspense key={video.id} fallback={<SkeletonCard />}>
-              <VideoCard
-                video={video}
-                downloading={downloading}
-                downloadFile={downloadFile}
-                formatDuration={formatDuration}
-                formatViews={formatViews}
+        <main>
+          <form onSubmit={searchVideos} className="flex gap-2 mb-4" role="search" aria-label="Search videos">
+            <div className="flex items-center gap-2 flex-1 bg-white rounded-md px-3 py-2 border border-gray-200 min-h-[44px]">
+              <Search size={18} className="text-gray-400" />
+              <input
+                className="outline-none border-0 w-full text-sm"
+                type="text" value={query} onChange={(e) => setQuery(e.target.value)}
+                placeholder="Search YouTube videos..." disabled={loading} autoFocus aria-label="Search query"
               />
-            </Suspense>
-          ))}
-        </div>
+              {query && <button type="button" className="bg-transparent border-0 text-lg cursor-pointer text-gray-400" onClick={() => { setQuery(''); setVideos([]); }}>×</button>}
+            </div>
 
-        {videos.length === 0 && !loading && (
-          <div className="empty-state">
-            <Music size={64} />
-            <p>Search for YouTube videos to download</p>
-            <small>Enter a search term above to get started</small>
+            <button
+              type="submit"
+              disabled={loading || !query.trim()}
+              className="min-w-[120px] bg-blue-600 text-white border-0 rounded-md px-4 py-2 cursor-pointer font-semibold disabled:bg-blue-200 disabled:cursor-not-allowed"
+            >
+              {loading ? 'Searching...' : 'Search'}
+            </button>
+          </form>
+
+          {error && (
+            <div className="flex items-center gap-3 bg-red-50 text-red-700 p-3 rounded-md border border-red-200 mb-3" role="alert">
+              <AlertCircle size={18} />
+              <span className="flex-1">{error}</span>
+              <button className="bg-transparent border-0 cursor-pointer text-lg" onClick={() => setError('')}>×</button>
+            </div>
+          )}
+
+          {videos.length > 0 && (
+            <div className="flex justify-between items-center my-2 text-gray-700 text-sm">
+              <p>Found {videos.length} video{videos.length !== 1 ? 's' : ''}</p>
+              <button className="bg-transparent border border-gray-200 px-2 py-1 rounded-sm cursor-pointer" onClick={() => setVideos([])}>Clear Results</button>
+            </div>
+          )}
+
+          <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4" aria-live="polite">
+            {videos.map(video => (
+              <Suspense key={video.id} fallback={<SkeletonCard />}>
+                <VideoCard
+                  video={video}
+                  downloading={downloading}
+                  downloadFile={downloadFile}
+                  formatDuration={formatDuration}
+                  formatViews={formatViews}
+                />
+              </Suspense>
+            ))}
           </div>
-        )}
 
-        {loading && (
-          <div className="loading-state" aria-live="polite">
-            <div className="spinner-large" role="status" />
-            <p>Searching YouTube...</p>
+          {videos.length === 0 && !loading && (
+            <div className="text-center py-8 text-gray-600">
+              <Music size={64} />
+              <p className="mt-4">Search for YouTube videos to download</p>
+              <small className="block mt-2 text-sm text-gray-500">Enter a search term above to get started</small>
+            </div>
+          )}
+
+          {loading && (
+            <div className="text-center py-8 text-gray-600" aria-live="polite">
+              <div className="w-11 h-11 rounded-full border-4 border-slate-100 border-t-blue-600 animate-spin mx-auto mb-3" role="status" />
+              <p>Searching YouTube...</p>
+            </div>
+          )}
+        </main>
+
+        <footer className="mt-6 text-center text-gray-500 text-sm">
+          <div>
+            <p className="mt-2 text-sm text-gray-500">© {new Date().getFullYear()} YouTube Downloader. Not affiliated with YouTube.</p>
           </div>
-        )}
-      </main>
-
-      <footer className="footer">
-        <div className="footer-content">
-          <p>⚠️ Educational Purpose Only | Respect Copyright Laws</p>
-          <p style={{ marginTop: 8 }} className="small">© {new Date().getFullYear()} YouTube Downloader. Not affiliated with YouTube.</p>
-        </div>
-      </footer>
+        </footer>
+      </div>
     </div>
   );
 }

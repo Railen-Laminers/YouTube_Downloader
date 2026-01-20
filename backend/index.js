@@ -1,4 +1,3 @@
-// index.js
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
@@ -9,6 +8,7 @@ const os = require('os');
 const path = require('path');
 const fs = require('fs');
 const { spawn } = require('child_process');
+const EventEmitter = require('events');
 
 let ytDlpExecWrapper = null;
 try {
@@ -48,7 +48,20 @@ const corsOptions = {
 app.use(cors(corsOptions));
 app.use(express.json());
 
-// Helper: get yt-dlp metadata via `yt-dlp -j`
+/** ---------- SSE progress helpers ---------- **/
+const progressEmitters = new Map();
+
+function getEmitter(key) {
+    if (!progressEmitters.has(key)) progressEmitters.set(key, new EventEmitter());
+    return progressEmitters.get(key);
+}
+
+function sendProgress(key, payload) {
+    const emitter = progressEmitters.get(key);
+    if (emitter) emitter.emit('progress', payload);
+}
+
+/** ---------- yt-dlp metadata helper ---------- **/
 function ytDlpMetadata(videoUrl) {
     return new Promise((resolve, reject) => {
         if (ytDlpExecWrapper) {
@@ -78,7 +91,39 @@ function ytDlpMetadata(videoUrl) {
     });
 }
 
-// Search endpoint
+/** ---------- SSE endpoint ---------- **/
+app.get('/api/progress/:key', (req, res) => {
+    const key = req.params.key;
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    // Allow CORS (cors middleware already applied), expose headers etc.
+    res.flushHeaders?.();
+
+    const emitter = getEmitter(key);
+    const onProgress = (payload) => {
+        try {
+            res.write(`data: ${JSON.stringify(payload)}\n\n`);
+        } catch (e) {
+            // write failed (client likely disconnected) — listener removal will clean up
+        }
+    };
+
+    emitter.on('progress', onProgress);
+
+    // Keep-alive comment every 15s for proxies that close idle SSE connections
+    const keepAlive = setInterval(() => {
+        try { res.write(':\n\n'); } catch (_) { }
+    }, 15000);
+
+    req.on('close', () => {
+        clearInterval(keepAlive);
+        emitter.removeListener('progress', onProgress);
+        if (emitter.listenerCount('progress') === 0) progressEmitters.delete(key);
+    });
+});
+
+/** ---------- Search endpoint ---------- **/
 app.get('/api/search', async (req, res) => {
     try {
         const { query } = req.query;
@@ -103,7 +148,7 @@ app.get('/api/search', async (req, res) => {
     }
 });
 
-// Video metadata endpoint
+/** ---------- Video metadata endpoint ---------- **/
 app.get('/api/video/:id', async (req, res) => {
     try {
         const id = req.params.id;
@@ -125,10 +170,11 @@ app.get('/api/video/:id', async (req, res) => {
 
 /**
  * Download endpoint:
- * - mp3 => yt-dlp bestaudio -> ffmpeg -> MP3 -> stream to client
+ * - mp3 => yt-dlp bestaudio -> ffmpeg -> MP3 -> stream to client (emit SSE progress)
  * - mp4 => yt-dlp merge -> write temp mp4 -> stream file -> delete temp file
  *
  * Query: ?format=mp3|mp4 (default mp3)
+ * Optional: ?key=<client-key> to tie SSE events to a client
  */
 app.get('/api/download/:id', async (req, res) => {
     const id = req.params.id;
@@ -146,6 +192,7 @@ app.get('/api/download/:id', async (req, res) => {
             return res.status(400).json({ error: 'Video too long. Maximum 1 hour allowed.' });
         }
         const safeTitle = (meta.title || 'download').replace(/[^\w\s.-]/gi, '').substring(0, 60);
+        const clientKey = (req.query.key) ? String(req.query.key) : `${id}_${format}`;
 
         if (format === 'mp3') {
             const filename = `${safeTitle}.mp3`;
@@ -159,6 +206,8 @@ app.get('/api/download/:id', async (req, res) => {
             res.setHeader('Access-Control-Expose-Headers', 'Content-Disposition');
             res.flushHeaders?.();
 
+            const emitter = getEmitter(clientKey);
+
             // spawn yt-dlp -> stdout (bestaudio)
             ytProc = spawn('yt-dlp', ['-f', 'bestaudio', '-o', '-', '--no-playlist', url], { stdio: ['ignore', 'pipe', 'pipe'] });
 
@@ -168,24 +217,44 @@ app.get('/api/download/:id', async (req, res) => {
             let ytErr = '';
             ytProc.stderr.on('data', d => { ytErr += d.toString(); });
 
-            // convert to mp3 using ffmpeg (fluent-ffmpeg)
+            // helper: timemark "HH:MM:SS.xx" -> seconds
+            const toSeconds = (tm) => {
+                if (!tm) return 0;
+                const parts = tm.split(':').map(p => parseFloat(p || 0));
+                if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
+                return 0;
+            };
+
+            // convert to mp3 using ffmpeg (fluent-ffmpeg), hooking progress
             const ff = ffmpeg(ytProc.stdout)
                 .audioBitrate(128)
                 .audioCodec('libmp3lame')
                 .format('mp3')
-                .on('start', cmd => console.log('FFmpeg command:', cmd))
-                .on('progress', p => { if (p && p.timemark) console.log('FFmpeg progress', p.timemark); })
+                .on('start', cmd => {
+                    console.log('FFmpeg command:', cmd);
+                    sendProgress(clientKey, { status: 'starting', progress: 0 });
+                })
+                .on('progress', p => {
+                    // p.timemark is "HH:MM:SS.xx"
+                    const seconds = toSeconds(p.timemark);
+                    const percent = duration ? Math.min(100, Math.floor((seconds / duration) * 100)) : null;
+                    sendProgress(clientKey, { status: 'converting', progress: percent, timemark: p.timemark });
+                })
                 .on('error', (err, stdout, stderr) => {
                     console.error('FFmpeg error:', err && err.message ? err.message : err);
                     console.error('ffmpeg stderr:', stderr || '');
                     try { ytProc.kill(); } catch (_) { }
+                    sendProgress(clientKey, { status: 'error', error: String(err) });
                     if (!res.headersSent) {
                         res.status(500).json({ error: 'Conversion failed', details: String(err) });
                     } else {
                         try { res.end(); } catch (_) { }
                     }
                 })
-                .on('end', () => console.log(`Conversion finished: ${filename}`));
+                .on('end', () => {
+                    console.log(`Conversion finished: ${filename}`);
+                    sendProgress(clientKey, { status: 'done', progress: 100 });
+                });
 
             // pipe ffmpeg output to the response (streaming)
             ff.pipe(res, { end: true });
@@ -194,6 +263,7 @@ app.get('/api/download/:id', async (req, res) => {
             req.on('close', () => {
                 if (req.aborted || res.finished) {
                     console.log('Client disconnected (mp3), killing yt-dlp/ffmpeg processes.');
+                    sendProgress(clientKey, { status: 'aborted' });
                     try { ytProc && ytProc.kill('SIGKILL'); } catch (_) { }
                 }
             });
@@ -315,23 +385,23 @@ app.get('/api/download/:id', async (req, res) => {
     }
 });
 
-// Health endpoint
+/** ---------- Health endpoint ---------- **/
 app.get('/api/health', (req, res) => {
     res.json({ status: 'OK', timestamp: new Date().toISOString(), tempDir: downloadsDir });
 });
 
-// Generic error handler
+/** ---------- Generic error handler ---------- **/
 app.use((err, req, res, next) => {
     console.error('Server error:', err);
     res.status(500).json({ error: 'Internal server error', message: process.env.NODE_ENV === 'development' ? String(err) : undefined });
 });
 
-// Start server
+/** ---------- Start server ---------- **/
 const server = app.listen(PORT, () => {
     console.log(`🚀 Server running on http://localhost:${PORT}`);
 });
 
-// Graceful shutdown
+/** ---------- Graceful shutdown ---------- **/
 const shutdown = () => {
     console.log('Shutting down server...');
     server.close(() => process.exit(0));
