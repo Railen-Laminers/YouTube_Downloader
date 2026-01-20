@@ -1,16 +1,31 @@
 import React, { useState, useEffect, lazy, Suspense } from 'react';
 import { Search, Music, AlertCircle } from 'lucide-react';
-const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:5000/api';
 const VideoCard = lazy(() => import('./VideoCard'));
+
+// Helper: safely produce a base API URL
+// Dev (vite) => use relative '/api' so Vite proxy handles it
+// Prod => use VITE_API_URL if provided (should include /api), otherwise fallback to localhost
+const isDev = Boolean(import.meta.env.DEV);
+const rawProdApi = (import.meta.env.VITE_API_URL || 'http://localhost:5000/api').toString().trim();
+
+// ensure no trailing slash for the base (we'll append segments safely)
+const prodApiBase = rawProdApi.replace(/\/$/, '');
+
+// final API base used by code:
+const API_BASE = isDev ? '/api' : prodApiBase; // in dev, use relative path so proxy works
+
+// safe join function so `${API_BASE}/search` never becomes invalid
+function joinApi(path) {
+  // path may already include query string, e.g. '/search?query=foo'
+  return `${API_BASE.replace(/\/$/, '')}/${path.replace(/^\//, '')}`;
+}
 
 function parseContentDisposition(headerValue) {
   if (!headerValue) return null;
-  // Try RFC5987 style: filename*=UTF-8''encodedfilename
   const fnStar = headerValue.match(/filename\*\s*=\s*([^']+?)''([^;]+)/i);
   if (fnStar) {
     try { return decodeURIComponent(fnStar[2]); } catch { return fnStar[2]; }
   }
-  // Try simple filename="..."
   const fn = headerValue.match(/filename="?(.+?)"?(\s*;|$)/i);
   if (fn) {
     try { return decodeURIComponent(fn[1]); } catch { return fn[1]; }
@@ -44,7 +59,7 @@ function App() {
 
   const checkHealth = async () => {
     try {
-      const response = await fetchWithTimeout(`${API_URL}/health`, {}, 7000);
+      const response = await fetchWithTimeout(joinApi('/health'), {}, 7000);
       if (response.ok) {
         const data = await response.json().catch(() => null);
         setHealthStatus(data || { status: 'OK' });
@@ -62,7 +77,7 @@ function App() {
     if (!query.trim()) return;
     setLoading(true); setError(''); setVideos([]);
     try {
-      const response = await fetchWithTimeout(`${API_URL}/search?query=${encodeURIComponent(query)}`, {}, 15000);
+      const response = await fetchWithTimeout(joinApi(`/search?query=${encodeURIComponent(query)}`), {}, 15000);
       const data = await response.json().catch(() => null);
       if (!response.ok) throw new Error((data && data.error) ? data.error : `Search failed (${response.status})`);
       if (!data || !Array.isArray(data)) throw new Error('Unexpected response from server.');
@@ -86,7 +101,7 @@ function App() {
     const timeoutId = setTimeout(() => controller.abort(), 8 * 60 * 1000);
 
     try {
-      const response = await fetch(`${API_URL}/download/${videoId}?format=${format}`, {
+      const response = await fetch(joinApi(`/download/${videoId}?format=${format}`), {
         method: 'GET',
         mode: 'cors',
         signal: controller.signal

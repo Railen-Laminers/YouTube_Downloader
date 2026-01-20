@@ -14,7 +14,7 @@ let ytDlpExecWrapper = null;
 try {
     const mod = require('yt-dlp-exec');
     ytDlpExecWrapper = typeof mod === 'function' ? mod : (mod.default || null);
-    if (ytDlpExecWrapper) console.log('✅ yt-dlp-exec wrapper detected.');
+    if (ytDlpExecWrapper) console.log('yt-dlp-exec wrapper detected.');
 } catch (e) {
     // not installed — we'll use system yt-dlp
 }
